@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Hardhat
+contracts/cache/
+contracts/artifacts/
+
+# Next.js
+frontend/.next/
+frontend/out/
+.next/
+
+# Environment / Secrets
+.env
+.env.*
+!.env.example
+*.pem
+oracle/attestations.json
+oracle/*.db
+oracle/*.db-wal
+oracle/*.db-shm
+
+# IDE / OS files
+.vscode/
+.DS_Store
+
+# Test
+.playwright-mcp/
