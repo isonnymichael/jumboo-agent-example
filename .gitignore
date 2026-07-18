@@ -1,29 +1,19 @@
 # Dependencies
 node_modules/
-**/node_modules/
 
-# Hardhat
-contracts/cache/
-contracts/artifacts/
-
-# Next.js
-frontend/.next/
-frontend/out/
-.next/
-
-# Environment / Secrets
+# Secrets — never commit real keys
 .env
 .env.*
 !.env.example
 *.pem
-oracle/attestations.json
-oracle/*.db
-oracle/*.db-wal
-oracle/*.db-shm
+
+# Runtime artifacts
+workspace/
+
+# Local DRY_RUN test remote (see README)
+test-remote.git/
 
 # IDE / OS files
 .vscode/
 .DS_Store
-
-# Test
-.playwright-mcp/
+Thumbs.db
