@@ -1,14 +1,19 @@
 /**
- * On-chain plumbing: read tasks + agent identity, submit validations.
- * ABI fragments mirror oracle/src/chain.js so both sides decode identically.
+ * On-chain reads + deriving the right hot wallet for an agent.
+ *
+ * This backend runs MANY agents from one master mnemonic (config.masterMnemonic).
+ * Each agent's hot wallet is HD-derived from the master at the per-agent index
+ * stored in its ERC-8004 metadata (`hotWalletIndex`). The marker signing + escrow
+ * claim themselves live in @jumboo/agent-sdk.
  */
 import { ethers } from "ethers";
+import { deriveHotWallet } from "@jumboo/agent-sdk";
 import { config } from "./config.js";
 
 export const provider = new ethers.JsonRpcProvider(config.rpcUrl);
 
-/** The agent's registered hot wallet — signs taskIds for PR markers. */
-export const hotWallet = new ethers.Wallet(config.agentHotKey);
+/** Address of the master's index-0 wallet — a public fingerprint, not a key. */
+export const masterFingerprint = deriveHotWallet(config.masterMnemonic, 0).address;
 
 // TaskState enum in JumbooTaskRegistry.sol
 export const TaskState = {
@@ -25,10 +30,6 @@ const IDENTITY_REGISTRY_ABI = [
   "function getAgent(uint256) view returns (address operatorWallet, address agentWallet, string agentURI, bool active)",
 ];
 
-const VALIDATION_REGISTRY_ABI = [
-  "function submitValidation(bytes32 taskId, uint256 agentId, uint8 outcome, bytes calldata signature) external",
-];
-
 export const taskRegistry = new ethers.Contract(config.taskRegistryAddress, TASK_REGISTRY_ABI, provider);
 export const identityRegistry = new ethers.Contract(config.identityRegistryAddress, IDENTITY_REGISTRY_ABI, provider);
 
@@ -39,8 +40,8 @@ export async function getTask(taskId) {
   return task;
 }
 
-/** Loads this backend's agent identity; returns null when not registered. */
-export async function getAgent(agentId = config.agentId) {
+/** Loads an agent's identity; returns null when it does not exist. */
+export async function getAgent(agentId) {
   try {
     const [operatorWallet, agentWallet, agentURI, active] = await identityRegistry.getAgent(agentId);
     return { operatorWallet, agentWallet, agentURI, active };
@@ -49,15 +50,35 @@ export async function getAgent(agentId = config.agentId) {
   }
 }
 
+/** Read the per-agent hot-wallet index out of the ERC-8004 data-URI metadata. */
+function hotWalletIndexFromUri(agentURI) {
+  try {
+    const m = String(agentURI).match(/^data:application\/json;base64,(.+)$/);
+    if (!m) return null;
+    const json = JSON.parse(Buffer.from(m[1], "base64").toString("utf8"));
+    return Number.isInteger(json.hotWalletIndex) ? json.hotWalletIndex : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
- * Submits an oracle attestation to JumbooValidationRegistry — for a Merged
- * outcome this releases the escrow to the agent's operator wallet.
- * Gas is paid by AGENT_TX_KEY (falls back to the hot key).
+ * Load an agent AND derive its hot wallet from our master mnemonic.
+ *
+ * Returns { agent, index, hotWallet, ownedByUs } or null when the agent does not
+ * exist. `ownedByUs` is true only when the derived wallet matches the agent's
+ * registered `agentWallet` — i.e. this agent was registered from OUR master, so
+ * we're allowed to sign for it. This is the trustless ownership check.
  */
-export async function submitValidation({ taskId, agentId, outcome, signature }) {
-  const txWallet = new ethers.Wallet(config.agentTxKey, provider);
-  const registry = new ethers.Contract(config.validationRegistryAddress, VALIDATION_REGISTRY_ABI, txWallet);
-  const tx = await registry.submitValidation(taskId, BigInt(agentId), outcome, signature);
-  const receipt = await tx.wait();
-  return { hash: tx.hash, blockNumber: receipt.blockNumber, status: receipt.status };
+export async function getAgentWithSigner(agentId) {
+  const agent = await getAgent(agentId);
+  if (!agent) return null;
+  const index = hotWalletIndexFromUri(agent.agentURI);
+  let hotWallet = null;
+  let ownedByUs = false;
+  if (index !== null) {
+    hotWallet = deriveHotWallet(config.masterMnemonic, index);
+    ownedByUs = hotWallet.address.toLowerCase() === agent.agentWallet.toLowerCase();
+  }
+  return { agent, index, hotWallet, ownedByUs };
 }

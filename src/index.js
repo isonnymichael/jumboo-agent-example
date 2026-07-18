@@ -1,12 +1,17 @@
 /**
- * jumboo-agent-example — reference autonomous agent backend for the Jumboo
- * protocol. Receives POST /solve, enforces the Compete/Hire (x402) access
- * policy, then runs the full pipeline: clone repo → solve issue → open PR
- * with the Jumboo marker block → poll the oracle → auto-claim the escrow.
+ * jumboo-agent-example — a Jumboo agent backend.
+ *
+ * Receives POST /solve { taskId, agentId }, enforces the Compete/Hire (x402)
+ * access policy, derives the agent's hot wallet from this backend's master
+ * mnemonic, then runs the pipeline: clone repo → solve issue → open PR with the
+ * Jumboo marker → poll the oracle → auto-claim the escrow (via @jumboo/agent-sdk).
+ *
+ * One backend serves every agent registered from its master — the frontend says
+ * which agentId to compete as; nothing to configure per agent.
  */
 import express from "express";
 import { config } from "./config.js";
-import { hotWallet, getAgent, getTask, TaskState } from "./chain.js";
+import { getTask, TaskState, getAgentWithSigner, masterFingerprint } from "./chain.js";
 import { verifyCaller, authorizeSolve } from "./auth.js";
 import { startJob, getJob, jobView, jobCount } from "./job.js";
 
@@ -16,8 +21,8 @@ app.use(express.json());
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
-    agentId: config.agentId,
-    wallet: hotWallet.address,
+    mode: "master",
+    master: masterFingerprint, // address of derivation index 0 (identifies the master)
     solver: config.solver,
     dryRun: config.dryRun,
     jobs: jobCount(),
@@ -29,7 +34,11 @@ app.post("/solve", async (req, res) => {
     // -- Request shape ------------------------------------------------------
     const taskId = req.body?.taskId;
     if (!/^0x[0-9a-fA-F]{64}$/.test(taskId || "")) {
-      return res.status(400).json({ error: "body must be { taskId: '0x<64 hex>' }" });
+      return res.status(400).json({ error: "body must include taskId: '0x<64 hex>'" });
+    }
+    const agentId = req.body?.agentId;
+    if (!/^\d+$/.test(String(agentId ?? ""))) {
+      return res.status(400).json({ error: "body must include agentId (the agent to compete as)" });
     }
 
     // -- Caller authentication (EIP-191 over `jumboo-solve:<taskId>`) --------
@@ -42,15 +51,23 @@ app.post("/solve", async (req, res) => {
       });
     }
 
-    // -- On-chain preconditions ----------------------------------------------
-    const agent = await getAgent(config.agentId);
-    if (!agent) {
-      return res.status(500).json({ error: `agent #${config.agentId} is not registered on-chain` });
+    // -- Resolve the agent + derive its hot wallet from our master ------------
+    const resolved = await getAgentWithSigner(agentId);
+    if (!resolved) {
+      return res.status(404).json({ error: `agent #${agentId} is not registered on-chain` });
     }
+    const { agent, hotWallet, ownedByUs } = resolved;
     if (!agent.active) {
-      return res.status(409).json({ error: `agent #${config.agentId} is inactive` });
+      return res.status(409).json({ error: `agent #${agentId} is inactive` });
+    }
+    if (!hotWallet) {
+      return res.status(409).json({ error: `agent #${agentId} has no hotWalletIndex in its metadata` });
+    }
+    if (!ownedByUs) {
+      return res.status(403).json({ error: `agent #${agentId} was not registered from this backend's master mnemonic` });
     }
 
+    // -- On-chain task preconditions ----------------------------------------
     const task = await getTask(taskId);
     if (!task) {
       return res.status(404).json({ error: "task not found on-chain" });
@@ -60,13 +77,13 @@ app.post("/solve", async (req, res) => {
     }
 
     // -- Access policy: operator = free, creator = x402, others = 403 --------
-    const decision = authorizeSolve({ req, caller, agent, task, taskId });
+    const decision = authorizeSolve({ req, caller, agent, task, taskId, agentId });
     if (!decision.allow) {
       return res.status(decision.status).json(decision.body);
     }
 
-    // -- Accepted: queue the async pipeline ----------------------------------
-    const job = startJob({ taskId, task, caller, path: decision.path });
+    // -- Accepted: queue the async pipeline for this agent -------------------
+    const job = startJob({ taskId, agentId, task, caller, path: decision.path, hotWallet });
     return res.status(202).json({ jobId: job.id, status: "queued" });
   } catch (err) {
     console.error(`[solve] ${err.stack || err.message}`);
@@ -82,8 +99,7 @@ app.get("/jobs/:id", (req, res) => {
 
 app.listen(config.port, () => {
   console.log(`jumboo-agent-example listening on :${config.port}`);
-  console.log(`  agent id:   #${config.agentId}`);
-  console.log(`  hot wallet: ${hotWallet.address}`);
-  console.log(`  solver:     ${config.solver}${config.dryRun ? " (DRY_RUN)" : ""}`);
-  console.log(`  oracle:     ${config.oracleUrl}`);
+  console.log(`  master:   ${masterFingerprint} (derivation index 0)`);
+  console.log(`  solver:   ${config.solver}${config.dryRun ? " (DRY_RUN)" : ""}`);
+  console.log(`  oracle:   ${config.oracleUrl}`);
 });

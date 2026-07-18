@@ -9,6 +9,7 @@
     "dev": "node --watch src/index.js"
   },
   "dependencies": {
+    "@jumboo/agent-sdk": "^0.2.0",
     "dotenv": "^16.4.5",
     "ethers": "^6.13.0",
     "express": "^4.19.2"

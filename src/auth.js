@@ -1,12 +1,11 @@
 /**
  * Caller authentication + the x402 access gate for POST /solve.
  *
- * Who may trigger /solve (NOTE.md RECOMMENDATION #6 — "the backend enforces it"):
+ * Who may trigger /solve:
  *   1. The agent OPERATOR (getAgent(AGENT_ID).operatorWallet)  → FREE (Compete path)
  *   2. The TASK CREATOR (tasks(taskId).creator)                → Hire path, pays a
  *      micro-fee via the HTTP 402 handshake (x402)
- *   3. Anyone else                                             → 403. Third parties must
- *      not be able to burn an operator's compute for tasks they have no stake in.
+ *   3. Anyone else                                             → 403.
  */
 import { ethers } from "ethers";
 import { config } from "./config.js";
@@ -33,13 +32,8 @@ export function verifyCaller(req, taskId) {
   return recovered;
 }
 
-/**
- * The authoritative x402 payment requirements for one /solve attempt.
- * Field names follow the shape the frontend's Hire simulation expects
- * (frontend/src/lib/x402.js): scheme/network/asset/resource/description,
- * wrapped in { x402Version, accepts: [...] }.
- */
-export function paymentRequirements({ taskId, operatorWallet }) {
+/** The authoritative x402 payment requirements for one /solve attempt. */
+export function paymentRequirements({ taskId, agentId, operatorWallet }) {
   return {
     x402Version: 1,
     accepts: [
@@ -50,7 +44,7 @@ export function paymentRequirements({ taskId, operatorWallet }) {
         amount: config.hirePrice.amount,
         payTo: operatorWallet,
         resource: "/solve",
-        description: `Hire agent #${config.agentId} to attempt task ${taskId}`,
+        description: `Hire agent #${agentId} to attempt task ${taskId}`,
       },
     ],
   };
@@ -58,15 +52,12 @@ export function paymentRequirements({ taskId, operatorWallet }) {
 
 /**
  * Validates the X-PAYMENT header against the quoted requirements.
- * The header must be base64-encoded JSON echoing the accepted terms:
- *   { "scheme": "exact", "asset": ..., "amount": ..., "payTo": ... }
  *
  * ============================ TODO — PRODUCTION ============================
  * This DEMO implementation only checks that the caller echoed the quoted
  * terms back. It TRUSTS the header. In production the X-PAYMENT payload must
- * be a signed payment that is verified AND settled through an x402
- * facilitator (e.g. POST /verify + /settle on a facilitator service) before
- * any compute is spent. Never ship this trust-the-header shortcut.
+ * be verified AND settled through an x402 facilitator before any compute is
+ * spent. Never ship this trust-the-header shortcut.
  * ===========================================================================
  */
 export function verifyPayment(req, requirements) {
@@ -93,13 +84,10 @@ export function verifyPayment(req, requirements) {
 }
 
 /**
- * The full access decision for POST /solve. `caller` is the verified wallet,
- * `agent` the on-chain identity, `task` the on-chain task.
- * Returns:
- *   { allow: true,  path: "compete" | "hire" }
- *   { allow: false, status, body }   — status 402 carries payment requirements
+ * The full access decision for POST /solve.
+ * Returns { allow: true, path } or { allow: false, status, body }.
  */
-export function authorizeSolve({ req, caller, agent, task, taskId }) {
+export function authorizeSolve({ req, caller, agent, task, taskId, agentId }) {
   // 1. Operator triggers its own agent → free (Compete).
   if (caller.toLowerCase() === agent.operatorWallet.toLowerCase()) {
     return { allow: true, path: "compete" };
@@ -107,11 +95,9 @@ export function authorizeSolve({ req, caller, agent, task, taskId }) {
 
   // 2. Task creator hires this agent → x402 handshake (Hire).
   if (caller.toLowerCase() === task.creator.toLowerCase()) {
-    const requirements = paymentRequirements({ taskId, operatorWallet: agent.operatorWallet });
+    const requirements = paymentRequirements({ taskId, agentId, operatorWallet: agent.operatorWallet });
     const payment = verifyPayment(req, requirements);
     if (!payment.ok) {
-      // No/invalid payment → quote the price. The client pays and retries
-      // the same request with the X-PAYMENT header.
       return {
         allow: false,
         status: 402,
@@ -121,7 +107,7 @@ export function authorizeSolve({ req, caller, agent, task, taskId }) {
     return { allow: true, path: "hire" };
   }
 
-  // 3. Everyone else is refused — no burning someone else's compute.
+  // 3. Everyone else is refused.
   return {
     allow: false,
     status: 403,

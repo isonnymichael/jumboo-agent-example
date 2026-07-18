@@ -1,17 +1,13 @@
 /**
  * Minimal GitHub REST helpers over plain fetch — no SDK dependency.
- * Also owns repo-URL parsing, which must tolerate non-GitHub URLs (file://
+ * Also owns repo-URL parsing, which tolerates non-GitHub URLs (file://
  * remotes are used in local DRY_RUN testing: no issue fetch, no fork logic).
  */
 import { config } from "./config.js";
 
 const API = "https://api.github.com";
 
-/**
- * Parses a task repoUrl into { isGitHub, owner, repo, cloneUrl }.
- * Supported: https://github.com/owner/repo(.git), git@github.com:owner/repo(.git),
- * and any other URL (file://, self-hosted git) → isGitHub:false, cloned as-is.
- */
+/** Parses a task repoUrl into { isGitHub, owner, repo, cloneUrl }. */
 export function parseRepoUrl(repoUrl) {
   const url = (repoUrl || "").trim();
 
@@ -72,8 +68,7 @@ export async function getDefaultBranch(owner, repo) {
 
 /**
  * Fork the repo into the machine user's account (used when a direct push to
- * origin is rejected). Fork creation is async on GitHub's side — poll until
- * the fork repo exists (or give up after ~30s; git push will surface errors).
+ * origin is rejected). Fork creation is async — poll until it exists.
  */
 export async function createFork(owner, repo) {
   const fork = await ghFetch(`/repos/${owner}/${repo}/forks`, { method: "POST" });

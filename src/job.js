@@ -4,6 +4,10 @@
  *   queued → cloning → solving → pushing → opening-pr → awaiting-merge
  *          → claiming → done | failed:<step>
  *
+ * The protocol-critical steps use @jumboo/agent-sdk:
+ *   - buildMarker: sign the taskId + build the PR marker block
+ *   - claim:       poll the oracle for the attestation, then submit it on-chain
+ *
  * DRY_RUN=1 stops after the push: the PR is not opened, the marker block is
  * logged instead, and attestation polling/claiming is skipped.
  */
@@ -12,8 +16,9 @@ import { randomBytes } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { ethers } from "ethers";
+import { buildMarker, claim, OUTCOME_NAME } from "@jumboo/agent-sdk";
 import { config } from "./config.js";
-import { hotWallet, submitValidation } from "./chain.js";
+import { provider } from "./chain.js";
 import { getSolver } from "./solver.js";
 import {
   parseRepoUrl,
@@ -25,8 +30,6 @@ import {
 } from "./github.js";
 
 const jobs = new Map();
-
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Run a child process, resolving stdout or rejecting with combined output. */
 function run(cmd, args, { cwd } = {}) {
@@ -47,12 +50,7 @@ function run(cmd, args, { cwd } = {}) {
   });
 }
 
-// git wrapper that never leaks the token into job logs
 const git = (args, opts) => run("git", args, opts);
-
-function markerBlock(taskId, agentId, signature) {
-  return `Jumboo-Task: ${taskId}\nJumboo-Agent: ${agentId}\nJumboo-Signature: ${signature}`;
-}
 
 function setStatus(job, status, detail) {
   job.status = status;
@@ -73,6 +71,7 @@ export function jobView(job) {
   return {
     jobId: job.id,
     taskId: job.taskId,
+    agentId: job.agentId ?? null,
     path: job.path,
     caller: job.caller,
     solver: job.solver,
@@ -90,10 +89,12 @@ export function jobView(job) {
 }
 
 /** Registers a queued job and kicks off the async pipeline. */
-export function startJob({ taskId, task, caller, path: accessPath }) {
+export function startJob({ taskId, agentId, task, caller, path: accessPath, hotWallet }) {
   const job = {
     id: randomBytes(8).toString("hex"),
     taskId,
+    agentId,
+    hotWallet, // the agent's derived hot wallet (never serialized in jobView)
     task,
     caller,
     path: accessPath, // "compete" | "hire"
@@ -106,7 +107,6 @@ export function startJob({ taskId, task, caller, path: accessPath }) {
   setStatus(job, "queued", `${accessPath} path, caller ${caller}`);
   setImmediate(() =>
     runJob(job).catch((err) => {
-      // Last-resort guard; runJob marks failed:<step> itself.
       job.error = job.error || err.message;
       if (!job.status.startsWith("failed")) job.status = "failed:unknown";
       console.error(`[job ${job.id}] pipeline crashed: ${err.message}`);
@@ -116,7 +116,7 @@ export function startJob({ taskId, task, caller, path: accessPath }) {
 }
 
 async function runJob(job) {
-  const { task, taskId } = job;
+  const { task, taskId, agentId, hotWallet } = job;
   const parsed = parseRepoUrl(task.repoUrl);
   const repoDir = path.join(config.workdir, job.id);
   const branch = `jumboo/task-${taskId.slice(2, 10)}`;
@@ -151,7 +151,7 @@ async function runJob(job) {
       [
         "-c", `user.name=${user}`,
         "-c", `user.email=${user}@users.noreply.github.com`,
-        "commit", "-m", `Jumboo task ${taskId.slice(0, 10)}… (agent #${config.agentId})`,
+        "commit", "-m", `Jumboo task ${taskId.slice(0, 10)}… (agent #${agentId})`,
       ],
       { cwd: repoDir }
     );
@@ -170,17 +170,15 @@ async function runJob(job) {
       prHead = `${fork.owner}:${branch}`;
     }
 
-    // 5. Sign the taskId with the hot wallet — EXACTLY what the oracle
-    //    recovers: ethers.verifyMessage(ethers.getBytes(taskId), signature)
-    const signature = await hotWallet.signMessage(ethers.getBytes(taskId));
-    const markers = markerBlock(taskId, config.agentId, signature);
-    job.markerBlock = markers;
+    // 5. Build the marker block (SDK signs the RAW taskId bytes for us) ------
+    const { marker } = await buildMarker({ taskId, agentId, hotWallet });
+    job.markerBlock = marker;
 
     // 6. Open the PR (or log the markers in DRY_RUN) -------------------------
     if (config.dryRun) {
       job.dryRun = true;
       console.log(`[job ${job.id}] DRY_RUN — skipping PR creation. Branch: ${prHead}`);
-      console.log(`[job ${job.id}] PR marker block:\n${markers}`);
+      console.log(`[job ${job.id}] PR marker block:\n${marker}`);
       setStatus(job, "done", `dry run: branch ${prHead} pushed, PR skipped`);
       return;
     }
@@ -192,44 +190,46 @@ async function runJob(job) {
     }
     const base = await getDefaultBranch(parsed.owner, parsed.repo);
     const pr = await createPullRequest(parsed.owner, parsed.repo, {
-      title: `Jumboo task ${taskId.slice(0, 10)}… (agent #${config.agentId})`,
+      title: `Jumboo task ${taskId.slice(0, 10)}… (agent #${agentId})`,
       head: prHead,
       base,
-      body: `${(job.summary || "").trim()}\n\n---\n${markers}`,
+      body: `${(job.summary || "").trim()}\n\n---\n${marker}`,
     });
     job.prUrl = pr.url;
     console.log(`[job ${job.id}] PR opened: ${pr.url}`);
 
-    // 7. Poll the oracle for an attestation, then claim on-chain ------------
+    // 7. Wait for the oracle's attestation, then claim on-chain (SDK) --------
     step = "awaiting-merge";
     setStatus(job, "awaiting-merge", `polling ${config.oracleUrl} every ${config.attestationPollSec}s`);
-    const attestation = await pollAttestation(taskId);
-    job.outcome = attestation.outcomeName;
-
-    // Submit whatever outcome the oracle attested — Merged releases the
-    // escrow; Superseded/Rejected are submitted too so the on-chain
-    // attempt/reputation counters stay honest.
-    step = "claiming";
-    setStatus(job, "claiming", `outcome=${attestation.outcomeName}`);
-    const receipt = await submitValidation({
+    // Gas payer: a shared funded wallet if AGENT_TX_KEY is set, else this agent's
+    // own derived hot wallet (which then needs a little ETH).
+    const txWallet = config.agentTxKey
+      ? new ethers.Wallet(config.agentTxKey, provider)
+      : hotWallet.connect(provider);
+    const { attestation, receipt } = await claim({
+      oracleUrl: config.oracleUrl,
+      registryAddress: config.validationRegistryAddress,
       taskId,
-      agentId: attestation.agentId,
-      outcome: Number(attestation.outcome),
-      signature: attestation.signature,
+      agentId,
+      wallet: txWallet,
+      intervalMs: config.attestationPollSec * 1000,
+      onPoll: ({ error }) => {
+        if (error) console.warn(`[job ${job.id}] poll: ${error.message}`);
+      },
     });
+    job.outcome = OUTCOME_NAME[Number(attestation.outcome)] ?? String(attestation.outcome);
+
+    step = "claiming";
+    setStatus(job, "claiming", `outcome=${job.outcome}`);
     job.claimTx = receipt.hash;
-    setStatus(job, "done", `outcome=${attestation.outcomeName}, tx=${receipt.hash}`);
+    setStatus(job, "done", `outcome=${job.outcome}, tx=${receipt.hash}`);
   } catch (err) {
     job.error = err.message;
     setStatus(job, `failed:${step}`, err.message);
   }
 }
 
-/**
- * Best-effort issue content for the solver prompt: when the repo is on GitHub,
- * a token is set, and issueId contains an integer, fetch title/body from the
- * API; otherwise fall back to the raw on-chain issueId string.
- */
+/** Best-effort issue content for the solver prompt. */
 async function resolveIssue(parsed, issueId) {
   const fallback = { title: "", body: "", ref: String(issueId) };
   if (!parsed.isGitHub || !config.githubToken) return fallback;
@@ -238,19 +238,4 @@ async function resolveIssue(parsed, issueId) {
   const issue = await getIssue(parsed.owner, parsed.repo, Number(match[0]));
   if (!issue) return fallback;
   return { ...issue, ref: `#${issue.number} ${issue.title}`.trim() };
-}
-
-/** Polls GET {ORACLE_URL}/attestations/{taskId}/{AGENT_ID} until one exists. */
-async function pollAttestation(taskId) {
-  const url = `${config.oracleUrl}/attestations/${taskId}/${config.agentId}`;
-  for (;;) {
-    try {
-      const res = await fetch(url);
-      if (res.ok) return await res.json();
-      if (res.status !== 404) console.warn(`[poll] oracle responded ${res.status} for ${url}`);
-    } catch (err) {
-      console.warn(`[poll] oracle unreachable: ${err.message}`);
-    }
-    await sleep(config.attestationPollSec * 1000);
-  }
 }
