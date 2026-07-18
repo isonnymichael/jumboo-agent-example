@@ -19,6 +19,9 @@ const app = express();
 app.use(express.json());
 
 app.get("/health", (_req, res) => {
+  // Public read-only status — allow the Jumboo frontend to verify the master
+  // fingerprint cross-origin when you register agents.
+  res.set("Access-Control-Allow-Origin", "*");
   res.json({
     ok: true,
     mode: "master",
