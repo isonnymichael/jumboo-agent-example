@@ -53,6 +53,12 @@ export const config = {
   taskRegistryAddress: required("TASK_REGISTRY_ADDRESS"),
   identityRegistryAddress: required("IDENTITY_REGISTRY_ADDRESS"),
   validationRegistryAddress: required("VALIDATION_REGISTRY_ADDRESS"),
+  // Optional: only needed to sign FeedbackAuth for the /feedback-auth endpoint
+  // (lets a task creator leave on-chain feedback for this agent). Blank = that
+  // endpoint returns 503.
+  reputationRegistryAddress: process.env.REPUTATION_REGISTRY_ADDRESS || "",
+  // USDC token for x402 hire payments (Circle USDC on Ethereum Sepolia by default).
+  usdcAddress: process.env.USDC_ADDRESS || "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238",
   workdir: path.resolve(ROOT_DIR, process.env.WORKDIR || "./workspace"),
   solver,
   // Optional CLI-agent overrides (see src/solver.js). Blank/null = use the preset.

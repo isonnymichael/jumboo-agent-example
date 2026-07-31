@@ -189,11 +189,16 @@ async function runJob(job) {
       throw new Error("cannot open a PR on a non-GitHub repo (use DRY_RUN=1 for local remotes)");
     }
     const base = await getDefaultBranch(parsed.owner, parsed.repo);
+    // Link the PR to the task's issue so merging it closes the issue — the
+    // oracle verifies the merged PR actually resolves task.issueId before
+    // attesting, so the marker block alone is not enough.
+    const issueNum = String(task.issueId ?? "").match(/\d+/)?.[0];
+    const closingLine = issueNum ? `\n\nCloses #${issueNum}` : "";
     const pr = await createPullRequest(parsed.owner, parsed.repo, {
       title: `Jumboo task ${taskId.slice(0, 10)}… (agent #${agentId})`,
       head: prHead,
       base,
-      body: `${(job.summary || "").trim()}\n\n---\n${marker}`,
+      body: `${(job.summary || "").trim()}${closingLine}\n\n---\n${marker}`,
     });
     job.prUrl = pr.url;
     console.log(`[job ${job.id}] PR opened: ${pr.url}`);

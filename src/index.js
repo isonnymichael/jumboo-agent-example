@@ -11,17 +11,29 @@
  */
 import express from "express";
 import { config } from "./config.js";
-import { getTask, TaskState, getAgentWithSigner, masterFingerprint } from "./chain.js";
+import { getTask, TaskState, getAgentWithSigner, masterFingerprint, signFeedbackAuth } from "./chain.js";
 import { verifyCaller, authorizeSolve } from "./auth.js";
+import { buildHireRequirements, verifyAndSettleHire } from "./x402.js";
 import { startJob, getJob, jobView, jobCount } from "./job.js";
 
 const app = express();
+
+// CORS: the Jumboo frontend calls /health (register flow) and /solve
+// (Compete/Hire) cross-origin from the browser. These are public endpoints —
+// the real authorization is the wallet signature + x402 payment, not the
+// origin — so allow any origin and answer the preflight for the custom headers.
+app.use((req, res, next) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type, X-Jumboo-Address, X-Jumboo-Signature, X-PAYMENT");
+  res.set("Access-Control-Max-Age", "86400");
+  if (req.method === "OPTIONS") return res.sendStatus(204);
+  next();
+});
+
 app.use(express.json());
 
 app.get("/health", (_req, res) => {
-  // Public read-only status — allow the Jumboo frontend to verify the master
-  // fingerprint cross-origin when you register agents.
-  res.set("Access-Control-Allow-Origin", "*");
   res.json({
     ok: true,
     mode: "master",
@@ -79,10 +91,31 @@ app.post("/solve", async (req, res) => {
       return res.status(409).json({ error: `task is not open (state=${task.state})` });
     }
 
-    // -- Access policy: operator = free, creator = x402, others = 403 --------
-    const decision = authorizeSolve({ req, caller, agent, task, taskId, agentId });
+    // -- Access policy: operator = free (Compete), creator = Hire, else 403 --
+    const decision = authorizeSolve({ caller, agent, task });
     if (!decision.allow) {
       return res.status(decision.status).json(decision.body);
+    }
+
+    // -- Hire path: verify + self-settle the x402 USDC payment before compute -
+    if (decision.path === "hire") {
+      const requirements = await buildHireRequirements({ taskId, agentId, operatorWallet: agent.operatorWallet });
+      const header = req.get("X-PAYMENT");
+      if (!header) {
+        return res.status(402).json({ error: "Payment required", ...requirements });
+      }
+      let payment;
+      try {
+        payment = JSON.parse(Buffer.from(header, "base64").toString("utf8"));
+      } catch {
+        return res.status(402).json({ error: "X-PAYMENT is not base64-encoded JSON", ...requirements });
+      }
+      try {
+        const settled = await verifyAndSettleHire({ payment, requirements, hotWallet });
+        console.log(`[solve] hire fee settled on-chain: ${settled.txHash}`);
+      } catch (err) {
+        return res.status(402).json({ error: `Payment failed: ${err.message}`, ...requirements });
+      }
     }
 
     // -- Accepted: queue the async pipeline for this agent -------------------
@@ -91,6 +124,31 @@ app.post("/solve", async (req, res) => {
   } catch (err) {
     console.error(`[solve] ${err.stack || err.message}`);
     return res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Sign a FeedbackAuth so a task creator can leave on-chain feedback for one of
+ * this backend's agents (ERC-8004 anti-spam: the auth names the client and caps
+ * them at one more entry). Public — the auth only lets the named clientAddress
+ * submit, and giveFeedback requires msg.sender == clientAddress.
+ */
+app.post("/feedback-auth", async (req, res) => {
+  try {
+    const agentId = req.body?.agentId;
+    if (!/^\d+$/.test(String(agentId ?? ""))) {
+      return res.status(400).json({ error: "body must include agentId" });
+    }
+    const clientAddress = req.body?.clientAddress;
+    if (!/^0x[0-9a-fA-F]{40}$/.test(clientAddress || "")) {
+      return res.status(400).json({ error: "body must include clientAddress: '0x<40 hex>'" });
+    }
+    const result = await signFeedbackAuth({ agentId, clientAddress });
+    return res.json(result);
+  } catch (err) {
+    const msg = err.message || "feedback-auth failed";
+    const status = /not configured/.test(msg) ? 503 : /control|not found|invalid/.test(msg) ? 400 : 500;
+    return res.status(status).json({ error: msg });
   }
 });
 
