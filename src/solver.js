@@ -107,6 +107,10 @@ function runCliAgent({ command, args, promptVia, prompt, repoDir }) {
     const { finalArgs, viaStdin } = buildInvocation({ args, promptVia, prompt });
     const child = spawn(command, finalArgs, {
       cwd: repoDir,
+      // Some CLI agents (e.g. opencode) resolve their working directory from
+      // $PWD rather than the process cwd — keep them in sync so edits land in the
+      // cloned repo, not $HOME.
+      env: { ...process.env, PWD: repoDir },
       shell: process.platform === "win32", // resolve .cmd shims on Windows
       windowsHide: true,
     });
@@ -134,8 +138,10 @@ function runCliAgent({ command, args, promptVia, prompt, repoDir }) {
     });
     if (viaStdin) {
       child.stdin.write(prompt);
-      child.stdin.end();
     }
+    // Always close stdin — arg/placeholder-mode agents (e.g. opencode) otherwise
+    // block waiting for stdin EOF and hang until the timeout.
+    child.stdin.end();
   });
 }
 
