@@ -112,14 +112,25 @@ function runCliAgent({ command, args, promptVia, prompt, repoDir }) {
     });
     let out = "";
     let err = "";
+    let settled = false;
+    // Hard timeout: a hung/looping CLI agent is killed so the job fails cleanly
+    // rather than blocking the pipeline forever.
+    const timeoutMs = (config.solverTimeoutSec || 600) * 1000;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      reject(new Error(`${command} timed out after ${config.solverTimeoutSec}s`));
+    }, timeoutMs);
+    const done = (fn, arg) => { if (settled) return; settled = true; clearTimeout(timer); fn(arg); };
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (err += d));
-    child.on("error", (e) => reject(new Error(`failed to spawn ${command}: ${e.message}`)));
+    child.on("error", (e) => done(reject, new Error(`failed to spawn ${command}: ${e.message}`)));
     child.on("close", (code) => {
       if (code !== 0) {
-        return reject(new Error(`${command} exited ${code}: ${(err || out).trim().slice(0, 1000)}`));
+        return done(reject, new Error(`${command} exited ${code}: ${(err || out).trim().slice(0, 1000)}`));
       }
-      resolve(out.trim().slice(0, SUMMARY_MAX) || `${command} produced no summary output.`);
+      done(resolve, out.trim().slice(0, SUMMARY_MAX) || `${command} produced no summary output.`);
     });
     if (viaStdin) {
       child.stdin.write(prompt);

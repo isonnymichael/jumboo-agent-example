@@ -65,6 +65,9 @@ export const config = {
   solverCommand: process.env.SOLVER_COMMAND || "",
   solverArgs: process.env.SOLVER_ARGS ? process.env.SOLVER_ARGS.split(" ").filter(Boolean) : null,
   solverPromptVia: process.env.SOLVER_PROMPT_VIA || "",
+  // Hard cap on a single solve run — a hung/looping CLI agent is killed and the
+  // job fails cleanly instead of hanging forever. Override with SOLVER_TIMEOUT_SEC.
+  solverTimeoutSec: intEnv("SOLVER_TIMEOUT_SEC", 600),
   hirePrice: {
     amount: process.env.HIRE_PRICE_AMOUNT || "0.50",
     asset: process.env.HIRE_PRICE_ASSET || "USDC",
