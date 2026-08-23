@@ -10,11 +10,12 @@
  * which agentId to compete as; nothing to configure per agent.
  */
 import express from "express";
+import { ethers } from "ethers";
 import { config } from "./config.js";
 import { getTask, TaskState, getAgentWithSigner, masterFingerprint, signFeedbackAuth } from "./chain.js";
 import { verifyCaller, authorizeSolve } from "./auth.js";
 import { buildHireRequirements, verifyAndSettleHire } from "./x402.js";
-import { startJob, getJob, jobView, jobCount } from "./job.js";
+import { startJob, startReviseJob, findActiveJob, getJob, jobView, jobCount } from "./job.js";
 
 const app = express();
 
@@ -101,6 +102,14 @@ app.post("/solve", async (req, res) => {
       return res.status(decision.status).json(decision.body);
     }
 
+    // -- Dedupe: a solve already running for this (task, agent) → return it ---
+    // Checked BEFORE settling any hire payment so a duplicate request is never
+    // charged and never spawns a second solver run / second PR.
+    const existing = findActiveJob(taskId, agentId, "solve");
+    if (existing) {
+      return res.status(202).json({ jobId: existing.id, status: existing.status, deduped: true });
+    }
+
     // -- Hire path: verify + self-settle the x402 USDC payment before compute -
     if (decision.path === "hire") {
       const requirements = await buildHireRequirements({ taskId, agentId, operatorWallet: agent.operatorWallet });
@@ -127,6 +136,97 @@ app.post("/solve", async (req, res) => {
     return res.status(202).json({ jobId: job.id, status: "queued" });
   } catch (err) {
     console.error(`[solve] ${err.stack || err.message}`);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// The oracle's signer address, fetched once from its /health and cached. Used
+// to verify that a /revise trigger really came from the oracle we trust (the
+// same one we poll for attestations), not an arbitrary caller.
+let oracleSignerCache = null;
+async function oracleSignerAddress() {
+  if (oracleSignerCache) return oracleSignerCache;
+  const res = await fetch(`${config.oracleUrl}/health`, { signal: AbortSignal.timeout(8000) });
+  if (!res.ok) throw new Error(`oracle /health → ${res.status}`);
+  const data = await res.json();
+  if (!data.oracle) throw new Error("oracle /health did not return a signer address");
+  oracleSignerCache = ethers.getAddress(data.oracle);
+  return oracleSignerCache;
+}
+
+/**
+ * Revise loop: the oracle calls this when a task creator requests changes on the
+ * agent's PR (instead of merging). It's authenticated by an oracle signature
+ * over `jumboo-revise:<taskId>:<agentId>:<prNumber>`. The agent re-runs its
+ * solver on the SAME PR branch with the review feedback and pushes — the PR is
+ * updated in place (a synchronize), no duplicate PR.
+ */
+app.post("/revise", async (req, res) => {
+  try {
+    const { taskId, agentId, prNumber, branch, headRepoFullName, feedback, signature } = req.body || {};
+    if (!/^0x[0-9a-fA-F]{64}$/.test(taskId || "")) {
+      return res.status(400).json({ error: "body must include taskId: '0x<64 hex>'" });
+    }
+    if (!/^\d+$/.test(String(agentId ?? ""))) {
+      return res.status(400).json({ error: "body must include agentId" });
+    }
+    if (!prNumber || !branch || !headRepoFullName) {
+      return res.status(400).json({ error: "body must include prNumber, branch and headRepoFullName" });
+    }
+    if (!signature) {
+      return res.status(400).json({ error: "body must include the oracle signature" });
+    }
+
+    // -- Trust check: the trigger must be signed by the oracle ---------------
+    const message = `jumboo-revise:${taskId}:${agentId}:${prNumber}`;
+    let recovered;
+    try {
+      recovered = ethers.verifyMessage(message, signature);
+    } catch {
+      return res.status(401).json({ error: "invalid oracle signature" });
+    }
+    let oracleAddr;
+    try {
+      oracleAddr = await oracleSignerAddress();
+    } catch (e) {
+      return res.status(503).json({ error: `cannot verify oracle right now: ${e.message}` });
+    }
+    if (recovered.toLowerCase() !== oracleAddr.toLowerCase()) {
+      return res.status(401).json({ error: "revise trigger not signed by the trusted oracle" });
+    }
+
+    // -- Must be one of our agents ------------------------------------------
+    const resolved = await getAgentWithSigner(agentId);
+    if (!resolved) {
+      return res.status(404).json({ error: `agent #${agentId} is not registered on-chain` });
+    }
+    const { hotWallet, ownedByUs } = resolved;
+    if (!hotWallet) {
+      return res.status(409).json({ error: `agent #${agentId} has no hotWalletIndex in its metadata` });
+    }
+    if (!ownedByUs) {
+      return res.status(403).json({ error: `agent #${agentId} was not registered from this backend's master mnemonic` });
+    }
+
+    // -- Revise only makes sense while the task is still open ----------------
+    const task = await getTask(taskId);
+    if (!task) {
+      return res.status(404).json({ error: "task not found on-chain" });
+    }
+    if (task.state !== TaskState.Created) {
+      return res.status(409).json({ error: `task is not open (state=${task.state})` });
+    }
+
+    const job = startReviseJob({
+      taskId,
+      agentId,
+      task,
+      hotWallet,
+      revise: { prNumber, branch, headRepoFullName, feedback: feedback || "" },
+    });
+    return res.status(202).json({ jobId: job.id, status: job.status });
+  } catch (err) {
+    console.error(`[revise] ${err.stack || err.message}`);
     return res.status(500).json({ error: err.message });
   }
 });

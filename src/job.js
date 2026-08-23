@@ -66,10 +66,38 @@ export function jobCount() {
   return jobs.size;
 }
 
+/** A job is terminal once it has finished (done) or failed. */
+function isTerminal(job) {
+  return job.status === "done" || String(job.status).startsWith("failed");
+}
+
+/**
+ * The still-running job for a (task, agent) pair of a given kind, if any.
+ * Used to dedupe: a second /solve while one is in flight would spawn a duplicate
+ * solver run and a duplicate PR; a second /revise while one is running would
+ * push twice. A solve that reached "awaiting-merge" still counts as in-flight
+ * (its PR exists) so re-solving is blocked — but a revise is a DIFFERENT kind,
+ * so it's allowed to run against that open PR.
+ */
+export function findActiveJob(taskId, agentId, kind = "solve") {
+  for (const job of jobs.values()) {
+    if (
+      job.kind === kind &&
+      job.taskId === taskId &&
+      Number(job.agentId) === Number(agentId) &&
+      !isTerminal(job)
+    ) {
+      return job;
+    }
+  }
+  return null;
+}
+
 /** Public JSON view of a job (no secrets are ever stored on the job object). */
 export function jobView(job) {
   return {
     jobId: job.id,
+    kind: job.kind ?? "solve",
     taskId: job.taskId,
     agentId: job.agentId ?? null,
     path: job.path,
@@ -90,8 +118,14 @@ export function jobView(job) {
 
 /** Registers a queued job and kicks off the async pipeline. */
 export function startJob({ taskId, agentId, task, caller, path: accessPath, hotWallet }) {
+  // Dedupe: never run two solves for the same (task, agent) at once — that would
+  // produce two solver runs and two PRs. Return the one already in flight.
+  const inFlight = findActiveJob(taskId, agentId, "solve");
+  if (inFlight) return inFlight;
+
   const job = {
     id: randomBytes(8).toString("hex"),
+    kind: "solve",
     taskId,
     agentId,
     hotWallet, // the agent's derived hot wallet (never serialized in jobView)
@@ -228,6 +262,105 @@ async function runJob(job) {
     setStatus(job, "claiming", `outcome=${job.outcome}`);
     job.claimTx = receipt.hash;
     setStatus(job, "done", `outcome=${job.outcome}, tx=${receipt.hash}`);
+  } catch (err) {
+    job.error = err.message;
+    setStatus(job, `failed:${step}`, err.message);
+  }
+}
+
+/**
+ * Registers a queued REVISE job and kicks off its pipeline. Triggered by the
+ * oracle when a task creator requests changes on the agent's PR (review → revise
+ * loop). Reuses the SAME PR branch, so the update lands as a PR synchronize — no
+ * new PR. Deduped against a revise already running for the pair.
+ */
+export function startReviseJob({ taskId, agentId, task, hotWallet, revise }) {
+  const inFlight = findActiveJob(taskId, agentId, "revise");
+  if (inFlight) return inFlight;
+
+  const job = {
+    id: randomBytes(8).toString("hex"),
+    kind: "revise",
+    taskId,
+    agentId,
+    hotWallet,
+    task,
+    path: "revise",
+    solver: config.solver,
+    status: "queued",
+    steps: [],
+    revise, // { prNumber, branch, headRepoFullName, feedback }
+    createdAt: new Date().toISOString(),
+  };
+  jobs.set(job.id, job);
+  setStatus(job, "queued", `revise PR #${revise.prNumber} on ${revise.headRepoFullName}@${revise.branch}`);
+  setImmediate(() =>
+    runReviseJob(job).catch((err) => {
+      job.error = job.error || err.message;
+      if (!job.status.startsWith("failed")) job.status = "failed:unknown";
+      console.error(`[job ${job.id}] revise pipeline crashed: ${err.message}`);
+    })
+  );
+  return job;
+}
+
+async function runReviseJob(job) {
+  const { task, taskId, agentId, revise } = job;
+  const { prNumber, branch, headRepoFullName, feedback } = revise;
+  const repoDir = path.join(config.workdir, job.id);
+  let step = "cloning";
+
+  try {
+    if (!branch || !headRepoFullName) {
+      throw new Error("revise trigger missing branch/headRepoFullName");
+    }
+    const [hOwner, hRepo] = headRepoFullName.split("/");
+
+    // 1. Clone the PR's head repo at its branch (a fork when the agent had no
+    //    push access to origin) — pushing back updates the same PR.
+    setStatus(job, "cloning", `${headRepoFullName}@${branch} → ${repoDir}`);
+    await mkdir(config.workdir, { recursive: true });
+    const cloneUrl = config.githubToken
+      ? `https://x-access-token:${config.githubToken}@github.com/${hOwner}/${hRepo}.git`
+      : `https://github.com/${hOwner}/${hRepo}.git`;
+    await git(["clone", "--branch", branch, cloneUrl, repoDir]);
+
+    // 2. Re-solve with the review feedback folded into the prompt.
+    step = "solving";
+    const parsed = parseRepoUrl(task.repoUrl);
+    const issue = await resolveIssue(parsed, task.issueId);
+    issue.reviewFeedback = feedback || "";
+    setStatus(job, "solving", `driver=${config.solver}, addressing review on PR #${prNumber}`);
+    const solver = getSolver();
+    const { summary } = await solver.solve({ repoDir, task, issue });
+    job.summary = summary;
+
+    // 3. Commit + push to the SAME branch → PR synchronize.
+    step = "pushing";
+    await git(["add", "-A"], { cwd: repoDir });
+    const changed = await git(["status", "--porcelain"], { cwd: repoDir });
+    if (!changed.trim()) {
+      setStatus(job, "done", "revision produced no changes — nothing to push");
+      return;
+    }
+    if (config.dryRun) {
+      job.dryRun = true;
+      setStatus(job, "done", `dry run: revision computed for PR #${prNumber}, push skipped`);
+      return;
+    }
+    const user = config.githubUsername;
+    await git(
+      [
+        "-c", `user.name=${user}`,
+        "-c", `user.email=${user}@users.noreply.github.com`,
+        "commit", "-m", `Address review feedback — Jumboo task ${taskId.slice(0, 10)}… (agent #${agentId})`,
+      ],
+      { cwd: repoDir }
+    );
+    step = "pushing";
+    setStatus(job, "pushing", `${headRepoFullName}@${branch}`);
+    await git(["push", "origin", branch], { cwd: repoDir });
+    setStatus(job, "done", `revised PR #${prNumber} — pushed to ${headRepoFullName}@${branch}`);
   } catch (err) {
     job.error = err.message;
     setStatus(job, `failed:${step}`, err.message);

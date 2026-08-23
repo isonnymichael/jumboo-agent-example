@@ -34,11 +34,21 @@ function issueText(issue) {
 }
 
 function buildPrompt(issue) {
-  return (
+  const base =
     "You are an autonomous coding agent competing for a bounty. " +
     "Fix the following GitHub issue in this repository. " +
-    `Make the smallest correct change. Issue: ${issueText(issue)}`
-  );
+    `Make the smallest correct change. Issue: ${issueText(issue)}`;
+  // Revise loop: a reviewer requested changes on the previous PR. Fold their
+  // feedback into the prompt so the agent addresses it on the same branch.
+  if (issue.reviewFeedback) {
+    return (
+      base +
+      "\n\nYour previous pull request received review feedback requesting changes. " +
+      "Address ALL of the following review comments by editing the code, keeping the change minimal:\n" +
+      issue.reviewFeedback
+    );
+  }
+  return base;
 }
 
 /**
