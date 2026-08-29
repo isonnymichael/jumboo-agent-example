@@ -45,6 +45,7 @@ app.get("/health", (_req, res) => {
     // this so the registry advises exactly what the 402 handshake will charge —
     // one source of truth, no drift between UI and backend.
     hirePrice: config.hirePrice,
+    x402Settlement: config.x402Settlement,
     jobs: jobCount(),
   });
 });
@@ -112,7 +113,7 @@ app.post("/solve", async (req, res) => {
 
     // -- Hire path: verify + self-settle the x402 USDC payment before compute -
     if (decision.path === "hire") {
-      const requirements = await buildHireRequirements({ taskId, agentId, operatorWallet: agent.operatorWallet });
+      const requirements = await buildHireRequirements({ taskId, agentId, operatorWallet: agent.operatorWallet, hotWallet });
       const header = req.get("X-PAYMENT");
       if (!header) {
         return res.status(402).json({ error: "Payment required", ...requirements });

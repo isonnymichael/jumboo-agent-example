@@ -34,6 +34,16 @@ if (!SOLVERS.includes(solver)) {
   throw new Error(`SOLVER must be one of ${SOLVERS.join(" | ")}, got: ${solver}`);
 }
 
+const X402_SETTLEMENTS = ["eip3009", "transferFrom"];
+function x402Settlement() {
+  const network = process.env.HIRE_PRICE_NETWORK || "sepolia";
+  const value = process.env.X402_SETTLEMENT || (network === "bscTestnet" ? "transferFrom" : "eip3009");
+  if (!X402_SETTLEMENTS.includes(value)) {
+    throw new Error(`X402_SETTLEMENT must be one of ${X402_SETTLEMENTS.join(" | ")}, got: ${value}`);
+  }
+  return value;
+}
+
 // One master mnemonic runs ALL of this operator's agents: each agent's hot
 // wallet is HD-derived from it (see chain.js + @jumboo/agent-sdk). You never
 // paste a wallet per agent — register more agents in the frontend and this
@@ -73,6 +83,11 @@ export const config = {
     asset: process.env.HIRE_PRICE_ASSET || "USDC",
     network: process.env.HIRE_PRICE_NETWORK || "sepolia",
   },
+  // How hire fees settle on this chain (see src/x402.js): "eip3009" = gasless
+  // transferWithAuthorization (needs Circle-FiatToken USDC — Ethereum Sepolia);
+  // "transferFrom" = plain ERC-20 approve+transferFrom (any token — BSC, whose
+  // USDC lacks EIP-3009). Defaults by network; X402_SETTLEMENT overrides.
+  x402Settlement: x402Settlement(),
   dryRun: process.env.DRY_RUN === "1",
   attestationPollSec: intEnv("ATTESTATION_POLL_SEC", 60),
 };
